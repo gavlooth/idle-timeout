@@ -63,6 +63,7 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 	fmt.Println()
 
 	cmd := exec.Command(cmdName, cmdArgs...)
+	cmd.Env = os.Environ() // Inherit all environment variables exactly
 
 	// Get initial terminal size
 	var initialSize *pty.Winsize
@@ -86,9 +87,10 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 	}
 	defer ptmx.Close()
 
-	// Set stdin to raw mode AFTER starting PTY
+	// Only use raw mode if we need interactive input
+	// For non-interactive use (like with parallel), skip raw mode
 	var oldState *term.State
-	if term.IsTerminal(int(os.Stdin.Fd())) {
+	if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd())) {
 		oldState, _ = term.MakeRaw(int(os.Stdin.Fd()))
 	}
 	defer func() {
