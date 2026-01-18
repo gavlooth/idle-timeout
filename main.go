@@ -12,17 +12,14 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/creack/pty"
-	"golang.org/x/term"
 )
 
 // parseDuration parses a duration string, defaulting to seconds if no unit
@@ -62,53 +59,35 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 	}
 	fmt.Println()
 
-	cmd := exec.Command(cmdName, cmdArgs...)
-	cmd.Env = os.Environ() // Inherit all environment variables exactly
-
-	// Get initial terminal size
-	var initialSize *pty.Winsize
-	if term.IsTerminal(int(os.Stdin.Fd())) {
-		if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
-			initialSize = ws
+	// Build the command string for script
+	cmdStr := cmdName
+	for _, arg := range cmdArgs {
+		// Quote arguments that contain spaces
+		if strings.ContainsAny(arg, " \t\n'\"") {
+			cmdStr += " " + "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
+		} else {
+			cmdStr += " " + arg
 		}
 	}
 
-	// Start command with a PTY with correct initial size
-	var ptmx *os.File
-	var err error
-	if initialSize != nil {
-		ptmx, err = pty.StartWithSize(cmd, initialSize)
-	} else {
-		ptmx, err = pty.Start(cmd)
-	}
+	// Use 'script' command for perfect TTY emulation
+	// -q = quiet, -c = command, /dev/null = don't save typescript
+	cmd := exec.Command("script", "-q", "-c", cmdStr, "/dev/null")
+	cmd.Env = os.Environ()
+
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to start command with pty: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to create stdout pipe: %v\n", err)
 		return 1
 	}
-	defer ptmx.Close()
 
-	// Only use raw mode if we need interactive input
-	// For non-interactive use (like with parallel), skip raw mode
-	var oldState *term.State
-	if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd())) {
-		oldState, _ = term.MakeRaw(int(os.Stdin.Fd()))
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start command: %v\n", err)
+		return 1
 	}
-	defer func() {
-		if oldState != nil {
-			term.Restore(int(os.Stdin.Fd()), oldState)
-		}
-	}()
-
-	// Handle terminal resize
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGWINCH)
-	go func() {
-		for range ch {
-			if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
-				pty.Setsize(ptmx, ws)
-			}
-		}
-	}()
 
 	// Handle interrupt signals
 	sigChan := make(chan os.Signal, 1)
@@ -130,11 +109,6 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 		mu.Unlock()
 	}
 
-	// Copy stdin to PTY
-	go func() {
-		io.Copy(ptmx, os.Stdin)
-	}()
-
 	// Timeout checker
 	done := make(chan struct{})
 	timedOut := false
@@ -153,7 +127,7 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 
 				if elapsed >= timeout {
 					timedOut = true
-					fmt.Fprintf(os.Stderr, "\r\n[idle-timeout] No output for %v, killing process...\r\n", timeout)
+					fmt.Fprintf(os.Stderr, "\n[idle-timeout] No output for %v, killing process...\n", timeout)
 					if cmd.Process != nil {
 						cmd.Process.Kill()
 					}
@@ -163,10 +137,10 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 		}
 	}()
 
-	// Copy PTY output to stdout, tracking activity
+	// Read output byte-by-byte for real-time display
 	buf := make([]byte, 4096)
 	for {
-		n, err := ptmx.Read(buf)
+		n, err := stdout.Read(buf)
 		if n > 0 {
 			resetTimer()
 			os.Stdout.Write(buf[:n])
