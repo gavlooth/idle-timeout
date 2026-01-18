@@ -55,7 +55,29 @@ func main() {
 }
 
 func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
+	// Print spawn line like expect does
+	fmt.Printf("spawn %s", cmdName)
+	for _, arg := range cmdArgs {
+		fmt.Printf(" %s", arg)
+	}
+	fmt.Println()
+
 	cmd := exec.Command(cmdName, cmdArgs...)
+
+	// Set stdin to raw mode BEFORE starting (to not miss early output)
+	var oldState *term.State
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		var err error
+		oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			oldState = nil
+		}
+	}
+	defer func() {
+		if oldState != nil {
+			term.Restore(int(os.Stdin.Fd()), oldState)
+		}
+	}()
 
 	// Start command with a PTY to preserve colors and interactive output
 	ptmx, err := pty.Start(cmd)
@@ -74,14 +96,6 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 		}
 	}()
 	ch <- syscall.SIGWINCH // Initial resize
-
-	// Set stdin to raw mode if it's a terminal
-	if term.IsTerminal(int(os.Stdin.Fd())) {
-		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-		if err == nil {
-			defer term.Restore(int(os.Stdin.Fd()), oldState)
-		}
-	}
 
 	// Handle interrupt signals
 	sigChan := make(chan os.Signal, 1)
@@ -137,12 +151,14 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 	}()
 
 	// Copy PTY output to stdout, tracking activity
-	buf := make([]byte, 4096)
+	// Use smaller buffer for more responsive output
+	buf := make([]byte, 1024)
 	for {
 		n, err := ptmx.Read(buf)
 		if n > 0 {
 			resetTimer()
 			os.Stdout.Write(buf[:n])
+			os.Stdout.Sync() // Flush immediately
 		}
 		if err != nil {
 			break
