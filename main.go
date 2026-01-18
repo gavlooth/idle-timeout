@@ -64,14 +64,32 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 
 	cmd := exec.Command(cmdName, cmdArgs...)
 
-	// Set stdin to raw mode BEFORE starting (to not miss early output)
+	// Get initial terminal size
+	var initialSize *pty.Winsize
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+			initialSize = ws
+		}
+	}
+
+	// Start command with a PTY with correct initial size
+	var ptmx *os.File
+	var err error
+	if initialSize != nil {
+		ptmx, err = pty.StartWithSize(cmd, initialSize)
+	} else {
+		ptmx, err = pty.Start(cmd)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start command with pty: %v\n", err)
+		return 1
+	}
+	defer ptmx.Close()
+
+	// Set stdin to raw mode AFTER starting PTY
 	var oldState *term.State
 	if term.IsTerminal(int(os.Stdin.Fd())) {
-		var err error
-		oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
-		if err != nil {
-			oldState = nil
-		}
+		oldState, _ = term.MakeRaw(int(os.Stdin.Fd()))
 	}
 	defer func() {
 		if oldState != nil {
@@ -79,23 +97,16 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 		}
 	}()
 
-	// Start command with a PTY to preserve colors and interactive output
-	ptmx, err := pty.Start(cmd)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to start command with pty: %v\n", err)
-		return 1
-	}
-	defer ptmx.Close()
-
 	// Handle terminal resize
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGWINCH)
 	go func() {
 		for range ch {
-			pty.InheritSize(os.Stdin, ptmx)
+			if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+				pty.Setsize(ptmx, ws)
+			}
 		}
 	}()
-	ch <- syscall.SIGWINCH // Initial resize
 
 	// Handle interrupt signals
 	sigChan := make(chan os.Signal, 1)
@@ -151,14 +162,12 @@ func run(cmdName string, cmdArgs []string, timeout time.Duration) int {
 	}()
 
 	// Copy PTY output to stdout, tracking activity
-	// Use smaller buffer for more responsive output
-	buf := make([]byte, 1024)
+	buf := make([]byte, 4096)
 	for {
 		n, err := ptmx.Read(buf)
 		if n > 0 {
 			resetTimer()
 			os.Stdout.Write(buf[:n])
-			os.Stdout.Sync() // Flush immediately
 		}
 		if err != nil {
 			break
